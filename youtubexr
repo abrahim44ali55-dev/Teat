@@ -1,0 +1,1507 @@
+/*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Standalone YouTube extractor using the player-JavaScript deciphering approach used by
+ * NewPipeExtractor. It does not depend on NewPipeExtractor itself. Rhino is required to execute
+ * YouTube's changing JavaScript signature function; see the setup note delivered with this file.
+ *
+ * Android use: add android.permission.INTERNET to the manifest and call extract() off the UI thread.
+ * For GPL distribution obligations, retain this notice and provide the corresponding source.
+ */
+package com.example.youtubeextractor;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.security.SecureRandom;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import org.mozilla.javascript.Context;
+import org.mozilla.javascript.Function;
+import org.mozilla.javascript.Scriptable;
+import org.mozilla.javascript.ScriptableObject;
+
+/**
+ * Extracts YouTube's currently exposed direct media URLs and related metadata without a library.
+ * This class uses YouTube InnerTube endpoints and may need client-version updates if YouTube changes.
+ */
+public final class StandaloneYouTubeExtractor {
+    private static final String API = "https://www.youtube.com/youtubei/v1/";
+    private static final String ANDROID_VERSION = "20.10.38";
+    private static final String WEB_VERSION = "2.20260805.01.00";
+    private static final String ANDROID_UA = "com.google.android.youtube/20.10.38 "
+            + "(Linux; U; Android 14; en_US; Pixel 7 Build/UP1A.231005.007) gzip";
+    private static final String WEB_UA = "Mozilla/5.0 (X11; Linux x86_64) "
+            + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+    private static volatile String cachedPlayerScript;
+    private static volatile String cachedSignatureProgram;
+    private static volatile String cachedThrottlingProgram;
+    private static volatile int cachedSignatureTimestamp = -1;
+    private static final Map<String, String> CACHED_N_PARAMETERS = new HashMap<>();
+
+    private StandaloneYouTubeExtractor() {
+    }
+
+    /**
+     * Extracts playable format URLs, audio tracks, subtitles, thumbnails, and the first comment page.
+     *
+     * @param watchUrl a YouTube watch URL, youtu.be URL, or 11-character video ID
+     * @return collected fields; comments may be empty when unavailable or blocked
+     */
+    public static Result extract(final String watchUrl) throws IOException {
+        final String videoId = videoIdFrom(watchUrl);
+        final Result result = new Result();
+        result.videoId = videoId;
+
+        try {
+            final Matcher timestamp = Pattern.compile("signatureTimestamp[=:](\\d+)")
+                    .matcher(loadPlayerScript(videoId));
+            if (timestamp.find()) cachedSignatureTimestamp = Integer.parseInt(timestamp.group(1));
+        } catch (final Exception e) {
+            result.warnings.add("Could not read player signature timestamp: " + message(e));
+        }
+
+        String contentPlaybackNonce = generateContentPlaybackNonce(16);
+        try {
+            final Map<String, Object> visionOsResponse = playerVisionOs(videoId,
+                    contentPlaybackNonce);
+            result.playerStatus = string(path(visionOsResponse, "playabilityStatus", "status"));
+            addPlayerData(visionOsResponse, videoId, result, contentPlaybackNonce);
+        } catch (final Exception e) {
+            result.warnings.add("NewPipe VISIONOS player request failed: " + message(e));
+        }
+
+        // Keep older InnerTube clients only as fallbacks; NewPipe 0.27.1 uses VISIONOS for streams.
+        if (result.mediaUrls.isEmpty() || result.cipheredFormats > 0) {
+            try {
+                final Map<String, Object> androidResponse = player(videoId, Client.ANDROID);
+                addPlayerData(androidResponse, videoId, result);
+                if (result.playerStatus == null) {
+                    result.playerStatus = string(path(androidResponse,
+                            "playabilityStatus", "status"));
+                }
+            } catch (final Exception androidError) {
+                result.warnings.add("Android player fallback: " + message(androidError));
+            }
+            if (result.mediaUrls.isEmpty() || result.cipheredFormats > 0) {
+                try {
+                    final Map<String, Object> iosResponse = player(videoId, Client.IOS);
+                    addPlayerData(iosResponse, videoId, result);
+                    if (result.playerStatus == null) {
+                        result.playerStatus = string(path(iosResponse,
+                                "playabilityStatus", "status"));
+                    }
+                } catch (final Exception e) {
+                    result.warnings.add("iOS player fallback: " + message(e));
+                }
+            }
+        }
+
+        if (result.title == null && result.mediaUrls.isEmpty()) {
+            result.warnings.add("YouTube did not return playable player data; status="
+                    + result.playerStatus);
+        }
+        if (result.cipheredFormats > 0) {
+            result.warnings.add("Some formats were signature-ciphered and did not include a direct URL.");
+        }
+
+        try {
+            final CommentsPage firstPage = getComments(videoId, null);
+            result.comments.addAll(firstPage.comments);
+            result.nextCommentsToken = firstPage.continuation;
+            result.commentsAvailable = !firstPage.comments.isEmpty()
+                    || firstPage.continuation != null;
+            result.commentCount = firstPage.commentCount;
+        } catch (final Exception e) {
+            result.warnings.add("Comments unavailable: " + message(e));
+        }
+        return result;
+    }
+
+    /** Load another comments page using Result.nextCommentsToken. */
+    public static CommentsPage loadMoreComments(final String videoIdOrUrl, final String token)
+            throws IOException {
+        if (token == null || token.isEmpty()) {
+            return new CommentsPage(Collections.emptyList(), null, -1);
+        }
+        final String videoId = videoIdFrom(videoIdOrUrl);
+        return getComments(videoId, token);
+    }
+
+    private static Map<String, Object> player(final String videoId, final Client client)
+            throws IOException {
+        final Map<String, Object> body = map(
+                "context", client.context(),
+                "videoId", videoId,
+                "contentCheckOk", true,
+                "racyCheckOk", true);
+        if (cachedSignatureTimestamp > 0) {
+            body.put("playbackContext", map("contentPlaybackContext",
+                    map("signatureTimestamp", cachedSignatureTimestamp)));
+        }
+        return post("player", body, client);
+    }
+
+    private static Map<String, Object> playerVisionOs(final String videoId,
+                                                       final String contentPlaybackNonce)
+            throws IOException {
+        final Client client = Client.VISIONOS;
+        final String visitorData = getVisionOsVisitorData();
+        final Map<String, Object> body = map(
+                "context", visionOsContext(visitorData),
+                "videoId", videoId,
+                "cpn", contentPlaybackNonce,
+                "contentCheckOk", true,
+                "racyCheckOk", true);
+        if (cachedSignatureTimestamp > 0) {
+            body.put("playbackContext", map("contentPlaybackContext",
+                    map("signatureTimestamp", cachedSignatureTimestamp)));
+        }
+        final String target = "https://youtubei.googleapis.com/youtubei/v1/player"
+                + "?prettyPrint=false&t=" + generateContentPlaybackNonce(12)
+                + "&id=" + videoId;
+        return postToUrl(target, body, client);
+    }
+
+    private static String getVisionOsVisitorData() throws IOException {
+        final String target = "https://youtubei.googleapis.com/youtubei/v1/visitor_id"
+                + "?prettyPrint=false";
+        final Map<String, Object> response = postToUrl(target,
+                map("context", visionOsContext(null)), Client.VISIONOS);
+        final String visitorData = string(path(response, "responseContext", "visitorData"));
+        if (visitorData == null || visitorData.isEmpty()) {
+            throw new IOException("NewPipe VISIONOS visitor_id response had no visitorData");
+        }
+        return visitorData;
+    }
+
+    private static Map<String, Object> visionOsContext(final String visitorData) {
+        final Map<String, Object> client = map(
+                "clientName", "VISIONOS",
+                "clientVersion", "1.04",
+                "clientScreen", "WATCH",
+                "platform", "MOBILE",
+                "deviceMake", "Apple",
+                "deviceModel", "RealityDevice17,1",
+                "osName", "visionOS",
+                "osVersion", "26.6.0.23O770",
+                "hl", "en",
+                "gl", "US",
+                "utcOffsetMinutes", 0);
+        if (visitorData != null) client.put("visitorData", visitorData);
+        return map("client", client,
+                "request", map("internalExperimentFlags", new ArrayList<>(), "useSsl", true),
+                "user", map("lockedSafetyMode", false));
+    }
+
+    private static String generateContentPlaybackNonce(final int length) {
+        final String alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        final StringBuilder value = new StringBuilder(length);
+        for (int i = 0; i < length; i++) {
+            value.append(alphabet.charAt(SECURE_RANDOM.nextInt(alphabet.length())));
+        }
+        return value.toString();
+    }
+
+    private static void addPlayerData(final Map<String, Object> response, final String videoId,
+                                      final Result result) {
+        addPlayerData(response, videoId, result, null);
+    }
+
+    private static void addPlayerData(final Map<String, Object> response, final String videoId,
+                                      final Result result, final String contentPlaybackNonce) {
+        final Map<String, Object> details = object(response.get("videoDetails"));
+        if (result.title == null) {
+            result.title = string(details.get("title"));
+            result.author = string(details.get("author"));
+            result.durationSeconds = number(details.get("lengthSeconds"), -1);
+            result.description = string(details.get("shortDescription"));
+        }
+
+        final Map<String, Object> streaming = object(response.get("streamingData"));
+        addFormats(array(streaming.get("formats")), "formats", videoId, result,
+                contentPlaybackNonce);
+        addFormats(array(streaming.get("adaptiveFormats")), "adaptiveFormats", videoId, result,
+                contentPlaybackNonce);
+
+        final Map<String, Object> captions = object(path(response,
+                "captions", "playerCaptionsTracklistRenderer"));
+        for (final Object value : array(captions.get("captionTracks"))) {
+            final Map<String, Object> track = object(value);
+            final String baseUrl = string(track.get("baseUrl"));
+            if (baseUrl == null) {
+                continue;
+            }
+            final Subtitle subtitle = new Subtitle();
+            subtitle.url = appendQuery(baseUrl, "fmt", "vtt");
+            subtitle.language = string(track.get("languageCode"));
+            subtitle.name = text(track.get("name"));
+            subtitle.autoGenerated = string(track.get("vssId")) != null
+                    && string(track.get("vssId")).startsWith("a.");
+            addUnique(result.subtitles, subtitle, subtitle.url);
+        }
+
+        final Map<String, Object> thumbnail = object(details.get("thumbnail"));
+        for (final Object value : array(thumbnail.get("thumbnails"))) {
+            final Map<String, Object> item = object(value);
+            final String imageUrl = string(item.get("url"));
+            if (imageUrl != null) {
+                final Thumbnail image = new Thumbnail();
+                image.url = imageUrl;
+                image.width = (int) number(item.get("width"), -1);
+                image.height = (int) number(item.get("height"), -1);
+                addUnique(result.thumbnails, image, imageUrl);
+            }
+        }
+    }
+
+    private static void addFormats(final List<Object> formats, final String source,
+                                   final String videoId, final Result result) {
+        addFormats(formats, source, videoId, result, null);
+    }
+
+    private static void addFormats(final List<Object> formats, final String source,
+                                   final String videoId, final Result result,
+                                   final String contentPlaybackNonce) {
+        for (final Object raw : formats) {
+            final Map<String, Object> format = object(raw);
+            String url = string(format.get("url"));
+            final Map<String, String> cipher = parseQuery(string(firstNonNull(
+                    format.get("signatureCipher"), format.get("cipher"))));
+            if (!cipher.isEmpty()) {
+                if (url == null) url = cipher.get("url");
+                final String clearSignature = firstNonEmpty(cipher.get("sig"),
+                        cipher.get("signature"));
+                final String obfuscatedSignature = cipher.get("s");
+                final String parameter = firstNonEmpty(cipher.get("sp"), "signature");
+                if (url != null && clearSignature != null) {
+                    url = appendQuery(url, parameter, clearSignature);
+                } else if (url != null && obfuscatedSignature != null) {
+                    try {
+                        url = appendQuery(url, parameter,
+                                decipherSignature(videoId, obfuscatedSignature));
+                    } catch (final Exception e) {
+                        result.cipheredFormats++;
+                        result.warnings.add("Signature decipher failed for itag "
+                                + number(format.get("itag"), -1) + ": " + message(e));
+                        continue;
+                    }
+                }
+            }
+            if (url == null || !url.startsWith("http")) {
+                continue;
+            }
+            if (hasQueryParameter(url, "n")) {
+                try {
+                    url = deobfuscateNParameter(videoId, url);
+                } catch (final Exception e) {
+                    result.warnings.add("n-parameter decipher failed for itag "
+                            + number(format.get("itag"), -1) + ": " + message(e));
+                    result.cipheredFormats++;
+                    continue;
+                }
+            }
+            if (contentPlaybackNonce != null && !hasQueryParameter(url, "cpn")) {
+                url = appendQuery(url, "cpn", contentPlaybackNonce);
+            }
+
+            final String mime = string(format.get("mimeType"));
+            final String lowerMime = mime == null ? "" : mime.toLowerCase();
+            final String codecs = mime == null ? "" : mime.toLowerCase();
+            final Map<String, Object> audioTrack = object(format.get("audioTrack"));
+            final MediaLink link = new MediaLink();
+            link.url = url;
+            link.itag = (int) number(format.get("itag"), -1);
+            link.mimeType = mime;
+            link.quality = string(format.get("qualityLabel"));
+            if (link.quality == null) {
+                link.quality = string(format.get("quality"));
+            }
+            link.width = (int) number(format.get("width"), -1);
+            link.height = (int) number(format.get("height"), -1);
+            link.fps = (int) number(format.get("fps"), -1);
+            link.bitrate = number(format.get("bitrate"), -1);
+            link.audioTrackId = string(audioTrack.get("id"));
+            link.audioTrackName = string(audioTrack.get("displayName"));
+            link.audioLanguage = languageFromTrackId(link.audioTrackId);
+            link.autoDubbed = bool(audioTrack.get("isAutoDubbed"));
+            link.source = source;
+
+            if (lowerMime.startsWith("audio/")) {
+                link.kind = "audio";
+                addUnique(result.audioStreams, link, link.url);
+                if (link.autoDubbed || looksDubbed(link.audioTrackName)) {
+                    addUnique(result.dubbedAudio, link, link.url);
+                }
+            } else if (lowerMime.startsWith("video/")) {
+                final boolean combined = source.equals("formats")
+                        || containsAudioCodec(codecs)
+                        || format.containsKey("audioQuality");
+                link.kind = combined ? "video-with-audio" : "video-only";
+                if (combined) {
+                    addUnique(result.videoWithAudio, link, link.url);
+                } else {
+                    addUnique(result.videoOnly, link, link.url);
+                }
+                // Some formats include audio tracks alongside video; expose them as audio tracks
+                // too, while preserving the combined video option.
+                if (combined && audioTrack.containsKey("id")
+                        && (link.autoDubbed || looksDubbed(link.audioTrackName))) {
+                    addUnique(result.dubbedAudio, link, link.url);
+                }
+            } else {
+                continue;
+            }
+            addUnique(result.mediaUrls, link, link.url);
+        }
+    }
+
+    private static boolean containsAudioCodec(final String mime) {
+        return mime.contains("mp4a") || mime.contains("opus") || mime.contains("vorbis")
+                || mime.contains("ac-3") || mime.contains("ec-3") || mime.contains("mp3");
+    }
+
+    /** Resolve YouTube's changing signature algorithm from the current base.js player. */
+    private static String decipherSignature(final String videoId, final String signature)
+            throws IOException {
+        String program = cachedSignatureProgram;
+        if (program == null) {
+            synchronized (StandaloneYouTubeExtractor.class) {
+                program = cachedSignatureProgram;
+                if (program == null) {
+                    program = buildSignatureProgram(loadPlayerScript(videoId));
+                    cachedSignatureProgram = program;
+                }
+            }
+        }
+        try (Context context = Context.enter()) {
+            context.setOptimizationLevel(-1);
+            final ScriptableObject scope = context.initSafeStandardObjects();
+            context.evaluateString(scope, program, "youtube-base-player", 1, null);
+            final Object candidate = ScriptableObject.getProperty(scope, "_np_deobfuscate");
+            if (!(candidate instanceof Function)) {
+                throw new IOException("Player signature function was not created");
+            }
+            final Object decoded = ((Function) candidate).call(context, scope, scope,
+                    new Object[]{signature});
+            final String value = Context.toString(decoded);
+            if (value.isEmpty() || "undefined".equals(value) || "null".equals(value)) {
+                throw new IOException("Player returned an empty signature");
+            }
+            return value;
+        } catch (final RuntimeException e) {
+            throw new IOException("Could not execute YouTube signature function", e);
+        }
+    }
+
+    /** Deobfuscate YouTube's throttling query parameter using the current player code. */
+    private static String deobfuscateNParameter(final String videoId, final String streamingUrl)
+            throws IOException {
+        final String obfuscated = queryParameter(streamingUrl, "n");
+        if (obfuscated == null || obfuscated.isEmpty()) return streamingUrl;
+        final String cached;
+        synchronized (CACHED_N_PARAMETERS) {
+            cached = CACHED_N_PARAMETERS.get(obfuscated);
+        }
+        if (cached != null) return streamingUrl.replace(obfuscated, cached);
+        String program = cachedThrottlingProgram;
+        if (program == null) {
+            synchronized (StandaloneYouTubeExtractor.class) {
+                program = cachedThrottlingProgram;
+                if (program == null) {
+                    program = buildThrottlingProgram(loadPlayerScript(videoId));
+                    cachedThrottlingProgram = program;
+                }
+            }
+        }
+        final String decoded = runPlayerFunction(program, "_np_deobfuscate_n", obfuscated);
+        if (decoded == null || decoded.isEmpty() || decoded.equals(obfuscated)
+                || "undefined".equals(decoded) || "null".equals(decoded)) {
+            throw new IOException("Player returned an invalid n parameter");
+        }
+        synchronized (CACHED_N_PARAMETERS) {
+            CACHED_N_PARAMETERS.put(obfuscated, decoded);
+        }
+        return replaceQueryParameter(streamingUrl, "n", decoded);
+    }
+
+    private static String buildThrottlingProgram(final String player) throws IOException {
+        // NewPipe locates the function which marks a URL with the "alr=yes" parameter; the
+        // first such call is inside the URL-construction/deobfuscation helper.
+        final String marker = "set(\"alr\",\"yes\")";
+        final int markerAt = player.indexOf(marker);
+        if (markerAt < 0) throw new IOException("Could not locate YouTube URL helper in base.js");
+        final int assignment = player.lastIndexOf("=function", markerAt);
+        if (assignment < 1) throw new IOException("Could not locate URL helper function");
+        int nameEnd = assignment;
+        int nameStart = nameEnd - 1;
+        while (nameStart >= 0 && (Character.isLetterOrDigit(player.charAt(nameStart))
+                || player.charAt(nameStart) == '_' || player.charAt(nameStart) == '$')) {
+            nameStart--;
+        }
+        final String functionName = player.substring(nameStart + 1, nameEnd);
+        if (functionName.isEmpty()) throw new IOException("Could not read URL helper name");
+        final String stripped = player
+                .replace("var _yt_player={};(function(g){var window=this;", "")
+                .replace("})(_yt_player);", "");
+        final StringBuilder code = new StringBuilder(stripped.length() + 2500);
+        code.append("var g={};")
+                .append("if(typeof Uint8Array===\"undefined\"){function Uint8Array(v,o,l){")
+                .append("var n=typeof v===\"number\"?v:(l==null?(v&&v.length||0):l);this.length=n;")
+                .append("this.byteLength=n;this.byteOffset=o||0;this.buffer=this;")
+                .append("for(var q=0;q<n;q++)this[q]=typeof v===\"number\"?0:v[q+(o||0)]||0;}")
+                .append("Uint8Array.prototype.set=function(a,o){o=o||0;for(var q=0;q<a.length;q++)this[q+o]=a[q];};")
+                .append("Uint8Array.prototype.subarray=function(a,b){return new Uint8Array(this.slice(a,b));};")
+                .append("Uint8Array.prototype.copyWithin=Array.prototype.copyWithin;")
+                .append("globalThis.Uint8Array=Uint8Array;}")
+                .append("if(typeof globalThis.XMLHttpRequest===\"undefined\")")
+                .append("globalThis.XMLHttpRequest={prototype:{}};")
+                .append("if(typeof URL===\"undefined\")globalThis.location={")
+                .append("hash:\"\",host:\"www.youtube.com\",hostname:\"www.youtube.com\",")
+                .append("href:\"https://www.youtube.com/\",origin:\"https://www.youtube.com\",")
+                .append("password:\"\",pathname:\"/\",port:\"\",protocol:\"https:\",")
+                .append("search:\"\",username:\"\"};")
+                .append("else globalThis.location=new URL(\"https://www.youtube.com\");")
+                .append("if(typeof globalThis.document===\"undefined\")")
+                .append("globalThis.document=Object.create(null);")
+                .append("if(typeof globalThis.navigator===\"undefined\")")
+                .append("globalThis.navigator=Object.create(null);")
+                .append("if(typeof globalThis.self===\"undefined\")globalThis.self=globalThis;")
+                .append("if(typeof globalThis.window===\"undefined\")globalThis.window=globalThis;")
+                .append(stripped)
+                .append("function _np_deobfuscate_n(n){var u=")
+                .append(functionName)
+                .append("(\"https://www.youtube.com/\",\"s\",undefined);u.set(\"n\",n);")
+                .append("var p=Object.getPrototypeOf(u),k=Object.keys(p).concat(Object.getOwnPropertyNames(p));")
+                .append("for(var i=0;i<k.length;i++){var x=k[i];")
+                .append("if(x!==\"constructor\"&&x!==\"set\"&&x!==\"get\"&&x!==\"clone\"){")
+                .append("u[x]();break;}}return u.get(\"n\");}");
+        return code.toString();
+    }
+
+    private static String runPlayerFunction(final String program, final String functionName,
+                                           final String argument) throws IOException {
+        try (Context context = Context.enter()) {
+            context.setOptimizationLevel(-1);
+            final Scriptable scope = context.initSafeStandardObjects();
+            context.evaluateString(scope, program, "youtube-base-player", 1, null);
+            final Object candidate = ScriptableObject.getProperty(scope, functionName);
+            if (!(candidate instanceof Function)) {
+                throw new IOException("Player transformation function is missing");
+            }
+            final Object result = ((Function) candidate).call(context, scope, scope,
+                    new Object[]{argument});
+            return Context.toString(result);
+        } catch (final RuntimeException e) {
+            throw new IOException("Could not execute YouTube n transformation", e);
+        }
+    }
+
+    private static boolean hasQueryParameter(final String url, final String key) {
+        return queryParameter(url, key) != null;
+    }
+
+    private static String queryParameter(final String url, final String key) {
+        try {
+            final URL parsed = new URL(url);
+            final String query = parsed.getQuery();
+            if (query == null) return null;
+            for (final String part : query.split("&")) {
+                final String[] pair = part.split("=", 2);
+                if (pair.length == 2 && key.equals(urlDecode(pair[0]))) return urlDecode(pair[1]);
+            }
+        } catch (final Exception ignored) { }
+        return null;
+    }
+
+    private static String replaceQueryParameter(final String url, final String key,
+                                                final String value) throws IOException {
+        try {
+            final String encodedKey = URLEncoder.encode(key, "UTF-8");
+            final String encodedValue = URLEncoder.encode(value, "UTF-8");
+            final int fragmentAt = url.indexOf('#');
+            final String fragment = fragmentAt < 0 ? "" : url.substring(fragmentAt);
+            final String base = fragmentAt < 0 ? url : url.substring(0, fragmentAt);
+            final String[] parts = base.split("\\?", 2);
+            if (parts.length < 2) return appendQuery(url, key, value);
+            final List<String> parameters = new ArrayList<>();
+            boolean replaced = false;
+            for (final String item : parts[1].split("&")) {
+                final String[] pair = item.split("=", 2);
+                if (pair.length > 0 && key.equals(urlDecode(pair[0]))) {
+                    if (!replaced) parameters.add(encodedKey + "=" + encodedValue);
+                    replaced = true;
+                } else {
+                    parameters.add(item);
+                }
+            }
+            if (!replaced) parameters.add(encodedKey + "=" + encodedValue);
+            return parts[0] + "?" + String.join("&", parameters) + fragment;
+        } catch (final Exception e) {
+            throw new IOException("Could not replace n query parameter", e);
+        }
+    }
+
+    private static String loadPlayerScript(final String videoId) throws IOException {
+        final String cached = cachedPlayerScript;
+        if (cached != null) return cached;
+        synchronized (StandaloneYouTubeExtractor.class) {
+            if (cachedPlayerScript != null) return cachedPlayerScript;
+            cachedPlayerScript = fetchPlayerScript(videoId);
+            return cachedPlayerScript;
+        }
+    }
+
+    private static String fetchPlayerScript(final String videoId) throws IOException {
+        final String iframe = httpGet("https://www.youtube.com/iframe_api");
+        final Matcher hash = Pattern.compile("player(?:\\\\/|/)([A-Za-z0-9_-]{8,})(?:\\\\/|/)")
+                .matcher(iframe);
+        String playerUrl = null;
+        if (hash.find()) {
+            playerUrl = "https://www.youtube.com/s/player/" + hash.group(1)
+                    + "/player_ias.vflset/en_US/base.js";
+        }
+        if (playerUrl == null) {
+            final String embed = httpGet("https://www.youtube.com/embed/" + videoId);
+            final Matcher jsUrl = Pattern.compile("\\\"jsUrl\\\":\\\"([^\\\"]*base\\.js)\\\"")
+                    .matcher(embed);
+            if (jsUrl.find()) {
+                playerUrl = jsUrl.group(1);
+                if (playerUrl.startsWith("/")) playerUrl = "https://www.youtube.com" + playerUrl;
+                else if (playerUrl.startsWith("//")) playerUrl = "https:" + playerUrl;
+            }
+        }
+        if (playerUrl == null) throw new IOException("Could not locate YouTube base.js player URL");
+        return httpGet(playerUrl);
+    }
+
+    private static String httpGet(final String target) throws IOException {
+        final HttpURLConnection connection = (HttpURLConnection) new URL(target).openConnection();
+        connection.setConnectTimeout(20000);
+        connection.setReadTimeout(30000);
+        connection.setRequestProperty("User-Agent", WEB_UA);
+        connection.setRequestProperty("Accept", "*/*");
+        try {
+            final int status = connection.getResponseCode();
+            final InputStream stream = status >= 400
+                    ? connection.getErrorStream() : connection.getInputStream();
+            if (status < 200 || status >= 300 || stream == null) {
+                throw new IOException("HTTP " + status + " loading " + target);
+            }
+            return readUtf8(stream);
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    /**
+     * Mirrors NewPipe's extraction sequence: locate the caller, the signature function, the
+     * constant array and its helper object, then execute only the extracted decipher code.
+     */
+    private static String buildSignatureProgram(final String player) throws IOException {
+        final String[] patterns = {
+                "([A-Za-z0-9_$]+)=function\\([^)]*\\)\\{[^}]*set\\(\\\"alr\\\",\\\"yes\\\"\\);[A-Za-z0-9_$]+&&",
+                "\\b(?:[\\w$]+)&&\\((?:[\\w$]+)=([\\w$]{2,})\\((\\d+,)decodeURIComponent\\((?:[\\w$]+)\\)\\)\\)",
+                "\\b(?:[\\w$]+)&&\\((?:[\\w$]+)=([\\w$]{2,})\\(decodeURIComponent\\((?:[\\w$]+)\\)\\)\\)",
+                "\\bm=([\\w$]{2,})\\(decodeURIComponent\\(h\\.s\\)\\)",
+                "\\bc&&\\(c=([\\w$]{2,})\\(decodeURIComponent\\(c\\)\\)"
+        };
+        String functionName = null;
+        String extraArgument = "";
+        for (final String expression : patterns) {
+            final Matcher matcher = Pattern.compile(expression).matcher(player);
+            if (matcher.find()) {
+                functionName = matcher.group(1);
+                if (matcher.groupCount() > 1 && matcher.group(2) != null) {
+                    extraArgument = matcher.group(2);
+                }
+                break;
+            }
+        }
+        if (functionName == null) {
+            final Matcher fallback = Pattern.compile(
+                    "([\\w$]{2,})\\s*=\\s*function\\(\\s*a\\s*\\)\\s*\\{\\s*a\\s*=\\s*a\\.split\\(\\s*\\\"\\\"\\s*\\)")
+                    .matcher(player);
+            if (fallback.find()) functionName = fallback.group(1);
+        }
+        if (functionName == null) throw new IOException("Cannot find signature function in player");
+
+        final String function = extractFunction(player, functionName);
+        final Matcher helperMatch = Pattern.compile("[;,]([A-Za-z0-9_$]{2,})\\s*\\.")
+                .matcher(function);
+        if (!helperMatch.find()) throw new IOException("Cannot identify signature helper object");
+        final String helperName = helperMatch.group(1);
+        final String helper = extractObject(player, helperName);
+        final Matcher arrayMatch = Pattern.compile(
+                "var\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*(?:'[^']*'|\\\"[^\\\"]*\\\")\\.split\\(\\\"[;{]\\\"\\)\\s*;")
+                .matcher(player);
+        final String constants = arrayMatch.find() ? arrayMatch.group() : "";
+        return constants + "\n" + helper + "\n" + function
+                + "\nfunction _np_deobfuscate(a){return " + functionName + "("
+                + extraArgument + "a);}";
+    }
+
+    private static String extractFunction(final String source, final String name)
+            throws IOException {
+        final Pattern[] starts = {
+                Pattern.compile("(?:var\\s+)?" + Pattern.quote(name) + "\\s*=\\s*function\\s*\\([^)]*\\)\\s*\\{"),
+                Pattern.compile("function\\s+" + Pattern.quote(name) + "\\s*\\([^)]*\\)\\s*\\{")
+        };
+        Matcher matcher = null;
+        for (final Pattern pattern : starts) {
+            matcher = pattern.matcher(source);
+            if (matcher.find()) break;
+            matcher = null;
+        }
+        if (matcher == null) throw new IOException("Signature function body not found: " + name);
+        final int open = source.indexOf('{', matcher.start());
+        final int close = matchingBrace(source, open);
+        return source.substring(matcher.start(), close + 1);
+    }
+
+    private static String extractObject(final String source, final String name) throws IOException {
+        final Matcher matcher = Pattern.compile("(?:var\\s+)?" + Pattern.quote(name)
+                + "\\s*=\\s*\\{").matcher(source);
+        if (!matcher.find()) throw new IOException("Signature helper object not found: " + name);
+        final int open = source.indexOf('{', matcher.start());
+        final int close = matchingBrace(source, open);
+        return source.substring(matcher.start(), close + 1) + ";";
+    }
+
+    private static int matchingBrace(final String source, final int open) throws IOException {
+        int depth = 0;
+        char quote = 0;
+        boolean escaped = false;
+        for (int i = open; i < source.length(); i++) {
+            final char c = source.charAt(i);
+            if (quote != 0) {
+                if (escaped) escaped = false;
+                else if (c == '\\') escaped = true;
+                else if (c == quote) quote = 0;
+                continue;
+            }
+            if (c == '\'' || c == '"' || c == '`') quote = c;
+            else if (c == '{') depth++;
+            else if (c == '}' && --depth == 0) return i;
+        }
+        throw new IOException("Unbalanced braces in YouTube player code");
+    }
+
+    private static boolean looksDubbed(final String name) {
+        if (name == null) {
+            return false;
+        }
+        final String lower = name.toLowerCase();
+        return lower.contains("dub") || lower.contains("audio track");
+    }
+
+    private static String languageFromTrackId(final String id) {
+        if (id == null) {
+            return null;
+        }
+        final int dot = id.indexOf('.');
+        return dot < 0 ? id : id.substring(0, dot);
+    }
+
+    private static CommentsPage getComments(final String videoId, final String continuation)
+            throws IOException {
+        final Map<String, Object> body;
+        if (continuation == null) {
+            body = map("context", Client.WEB.context(), "videoId", videoId);
+        } else {
+            body = map("context", Client.WEB.context(), "continuation", continuation);
+        }
+        final Map<String, Object> response = post("next", body, Client.WEB);
+        if (continuation == null) {
+            final String firstToken = findCommentsSectionToken(response);
+            if (firstToken == null) {
+                return new CommentsPage(Collections.emptyList(), null, -1);
+            }
+            return parseComments(post("next", map("context", Client.WEB.context(),
+                    "continuation", firstToken), Client.WEB));
+        }
+        return parseComments(response);
+    }
+
+    private static CommentsPage parseComments(final Map<String, Object> response) {
+        final List<Comment> comments = new ArrayList<>();
+        final Set<String> seen = new HashSet<>();
+        final Map<String, Map<String, Object>> payloads = new HashMap<>();
+        collectCommentPayloads(response, payloads);
+        collectModernComments(response, payloads, comments, seen);
+        collectLegacyComments(response, comments, seen);
+        final int count = findCommentCount(response);
+        final String next = findContinuation(response);
+        return new CommentsPage(comments, next, count);
+    }
+
+    private static void collectCommentPayloads(final Object value,
+            final Map<String, Map<String, Object>> payloads) {
+        if (value instanceof Map) {
+            final Map<String, Object> current = object(value);
+            if ("commentEntityPayload".equals(string(current.get("type")))) {
+                // Current YouTube responses normally wrap this payload under "payload".
+            }
+            final Object mutationsObject = path(current, "frameworkUpdates", "entityBatchUpdate",
+                    "mutations");
+            for (final Object raw : array(mutationsObject)) {
+                final Map<String, Object> mutation = object(raw);
+                final Map<String, Object> payload = object(mutation.get("payload"));
+                final Map<String, Object> entity = object(payload.get("commentEntityPayload"));
+                if (!entity.isEmpty()) {
+                    final String key = string(mutation.get("entityKey"));
+                    if (key != null) {
+                        payloads.put(key, entity);
+                    }
+                }
+            }
+            for (final Object child : current.values()) {
+                collectCommentPayloads(child, payloads);
+            }
+        } else if (value instanceof List) {
+            for (final Object child : array(value)) {
+                collectCommentPayloads(child, payloads);
+            }
+        }
+    }
+
+    private static void collectModernComments(final Object value,
+            final Map<String, Map<String, Object>> payloads,
+            final List<Comment> comments, final Set<String> seen) {
+        if (value instanceof Map) {
+            final Map<String, Object> current = object(value);
+            final Map<String, Object> view = object(current.get("commentViewModel"));
+            if (!view.isEmpty()) {
+                final String key = string(view.get("commentKey"));
+                final Map<String, Object> entity = payloads.get(key);
+                if (entity != null) {
+                    final Map<String, Object> props = object(entity.get("properties"));
+                    final Map<String, Object> author = object(entity.get("author"));
+                    final Map<String, Object> toolbar = object(entity.get("toolbar"));
+                    final Comment comment = new Comment();
+                    comment.id = string(props.get("commentId"));
+                    comment.text = string(path(props, "content", "content"));
+                    comment.author = string(author.get("displayName"));
+                    comment.authorChannelId = string(author.get("channelId"));
+                    comment.authorAvatar = string(author.get("avatarThumbnailUrl"));
+                    comment.published = string(props.get("publishedTime"));
+                    comment.likeCount = string(toolbar.get("likeCountLiked"));
+                    comment.replyCount = string(toolbar.get("replyCount"));
+                    if (comment.id != null && seen.add(comment.id)) {
+                        comments.add(comment);
+                    }
+                }
+            }
+            for (final Object child : current.values()) {
+                collectModernComments(child, payloads, comments, seen);
+            }
+        } else if (value instanceof List) {
+            for (final Object child : array(value)) {
+                collectModernComments(child, payloads, comments, seen);
+            }
+        }
+    }
+
+    private static void collectLegacyComments(final Object value,
+            final List<Comment> comments, final Set<String> seen) {
+        if (value instanceof Map) {
+            final Map<String, Object> current = object(value);
+            final Map<String, Object> renderer = object(current.get("commentRenderer"));
+            if (!renderer.isEmpty()) {
+                final Comment comment = new Comment();
+                comment.id = string(renderer.get("commentId"));
+                comment.text = text(renderer.get("contentText"));
+                comment.author = text(renderer.get("authorText"));
+                comment.authorAvatar = string(path(renderer, "authorThumbnail", "thumbnails", "0",
+                        "url"));
+                comment.published = text(renderer.get("publishedTimeText"));
+                comment.likeCount = text(renderer.get("voteCount"));
+                comment.replyCount = text(renderer.get("replyCount"));
+                if (comment.id != null && seen.add(comment.id)) {
+                    comments.add(comment);
+                }
+            }
+            for (final Object child : current.values()) {
+                collectLegacyComments(child, comments, seen);
+            }
+        } else if (value instanceof List) {
+            for (final Object child : array(value)) {
+                collectLegacyComments(child, comments, seen);
+            }
+        }
+    }
+
+    private static String findCommentsSectionToken(final Object value) {
+        if (value instanceof Map) {
+            final Map<String, Object> current = object(value);
+            if ("comments-section".equals(string(current.get("targetId")))) {
+                final List<Object> contents = array(current.get("contents"));
+                if (!contents.isEmpty()) {
+                    final String token = string(path(contents.get(0), "continuationItemRenderer",
+                            "continuationEndpoint", "continuationCommand", "token"));
+                    if (token != null) {
+                        return token;
+                    }
+                }
+            }
+            for (final Object child : current.values()) {
+                final String found = findCommentsSectionToken(child);
+                if (found != null) {
+                    return found;
+                }
+            }
+        } else if (value instanceof List) {
+            for (final Object child : array(value)) {
+                final String found = findCommentsSectionToken(child);
+                if (found != null) {
+                    return found;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static String findContinuation(final Object value) {
+        if (value instanceof Map) {
+            final Map<String, Object> current = object(value);
+            final String token = string(path(current, "continuationCommand", "token"));
+            if (token != null) {
+                return token;
+            }
+            for (final Object child : current.values()) {
+                final String found = findContinuation(child);
+                if (found != null) {
+                    return found;
+                }
+            }
+        } else if (value instanceof List) {
+            for (final Object child : array(value)) {
+                final String found = findContinuation(child);
+                if (found != null) {
+                    return found;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static int findCommentCount(final Object value) {
+        if (value instanceof Map) {
+            final Map<String, Object> current = object(value);
+            final Map<String, Object> header = object(current.get("commentsHeaderRenderer"));
+            if (!header.isEmpty()) {
+                final String raw = text(header.get("countText"));
+                if (raw != null) {
+                    final String digits = raw.replaceAll("[^0-9]", "");
+                    try {
+                        return Integer.parseInt(digits);
+                    } catch (final NumberFormatException ignored) {
+                        return -1;
+                    }
+                }
+            }
+            for (final Object child : current.values()) {
+                final int found = findCommentCount(child);
+                if (found >= 0) {
+                    return found;
+                }
+            }
+        } else if (value instanceof List) {
+            for (final Object child : array(value)) {
+                final int found = findCommentCount(child);
+                if (found >= 0) {
+                    return found;
+                }
+            }
+        }
+        return -1;
+    }
+
+    private static Map<String, Object> post(final String endpoint,
+            final Map<String, Object> body, final Client client) throws IOException {
+        return postToUrl(API + endpoint + "?prettyPrint=false", body, client);
+    }
+
+    private static Map<String, Object> postToUrl(final String target,
+            final Map<String, Object> body, final Client client) throws IOException {
+        final HttpURLConnection connection = (HttpURLConnection) new URL(target).openConnection();
+        connection.setRequestMethod("POST");
+        connection.setConnectTimeout(20_000);
+        connection.setReadTimeout(30_000);
+        connection.setDoOutput(true);
+        connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+        connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("User-Agent", client.userAgent);
+        if (client == Client.VISIONOS) {
+            connection.setRequestProperty("X-Goog-Api-Format-Version", "2");
+        } else {
+            connection.setRequestProperty("X-YouTube-Client-Name", client.id);
+            connection.setRequestProperty("X-YouTube-Client-Version", client.version);
+        }
+        final byte[] request = Json.write(body).getBytes(StandardCharsets.UTF_8);
+        connection.setFixedLengthStreamingMode(request.length);
+        try (OutputStream output = connection.getOutputStream()) {
+            output.write(request);
+        }
+        try {
+            final int status = connection.getResponseCode();
+            final InputStream input = status >= 400
+                    ? connection.getErrorStream() : connection.getInputStream();
+            final String response = input == null ? "" : readUtf8(input);
+            if (status < 200 || status >= 300) {
+                throw new IOException("YouTube " + target + " returned HTTP " + status
+                        + ": " + response.substring(0, Math.min(response.length(), 400)));
+            }
+            final Object parsed = Json.parse(response);
+            return object(parsed);
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    private static String readUtf8(final InputStream input) throws IOException {
+        try (InputStream in = input; ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            final byte[] buffer = new byte[8192];
+            int read;
+            while ((read = in.read(buffer)) != -1) {
+                out.write(buffer, 0, read);
+                if (out.size() > 25_000_000) {
+                    throw new IOException("YouTube response exceeded 25 MB");
+                }
+            }
+            return new String(out.toByteArray(), StandardCharsets.UTF_8);
+        }
+    }
+
+    private enum Client {
+        ANDROID("3", ANDROID_VERSION, ANDROID_UA),
+        IOS("5", "20.10.4", "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_0 like Mac OS X)"),
+        VISIONOS("101", "1.04", "com.google.visionos.youtube/1.04(RealityDevice17,1; U; CPU visionOS 26_6_0 like Mac OS X; US)"),
+        WEB("1", WEB_VERSION, WEB_UA);
+
+        final String id;
+        final String version;
+        final String userAgent;
+
+        Client(final String id, final String version, final String userAgent) {
+            this.id = id;
+            this.version = version;
+            this.userAgent = userAgent;
+        }
+
+        Map<String, Object> context() {
+            final Map<String, Object> client = map("hl", "en", "gl", "US",
+                    "clientName", name(), "clientVersion", version);
+            if (this == ANDROID) {
+                client.put("platform", "MOBILE");
+                client.put("deviceMake", "Google");
+                client.put("deviceModel", "Pixel 7");
+                client.put("osName", "Android");
+                client.put("osVersion", "14.0");
+                client.put("androidSdkVersion", 34);
+            } else if (this == IOS) {
+                client.put("platform", "MOBILE");
+                client.put("deviceMake", "Apple");
+                client.put("deviceModel", "iPhone16,2");
+                client.put("osName", "iPhone");
+                client.put("osVersion", "18.0");
+            } else {
+                client.put("platform", "DESKTOP");
+                client.put("clientScreen", "WATCH");
+                client.put("utcOffsetMinutes", 0);
+            }
+            final Map<String, Object> context = map(
+                    "client", client,
+                    "request", map("internalExperimentFlags", new ArrayList<>(), "useSsl", true),
+                    "user", map("lockedSafetyMode", false));
+            return context;
+        }
+    }
+
+    public static final class Result {
+        public String videoId;
+        public String title;
+        public String author;
+        public String description;
+        public String playerStatus;
+        public long durationSeconds = -1;
+        public int cipheredFormats;
+        public final List<MediaLink> mediaUrls = new ArrayList<>();
+        public final List<MediaLink> videoWithAudio = new ArrayList<>();
+        public final List<MediaLink> videoOnly = new ArrayList<>();
+        public final List<MediaLink> audioStreams = new ArrayList<>();
+        public final List<MediaLink> dubbedAudio = new ArrayList<>();
+        public final List<Subtitle> subtitles = new ArrayList<>();
+        public final List<Thumbnail> thumbnails = new ArrayList<>();
+        public final List<Comment> comments = new ArrayList<>();
+        public boolean commentsAvailable;
+        public int commentCount = -1;
+        public String nextCommentsToken;
+        public final List<String> warnings = new ArrayList<>();
+    }
+
+    public static final class MediaLink {
+        public String kind;
+        public String url;
+        public String mimeType;
+        public String quality;
+        public int itag = -1;
+        public int width = -1;
+        public int height = -1;
+        public int fps = -1;
+        public long bitrate = -1;
+        public String audioTrackId;
+        public String audioTrackName;
+        public String audioLanguage;
+        public boolean autoDubbed;
+        public String source;
+    }
+
+    public static final class Subtitle {
+        public String url;
+        public String language;
+        public String name;
+        public boolean autoGenerated;
+    }
+
+    public static final class Thumbnail {
+        public String url;
+        public int width;
+        public int height;
+    }
+
+    public static final class Comment {
+        public String id;
+        public String text;
+        public String author;
+        public String authorChannelId;
+        public String authorAvatar;
+        public String published;
+        public String likeCount;
+        public String replyCount;
+    }
+
+    public static final class CommentsPage {
+        public final List<Comment> comments;
+        public final String continuation;
+        public final int commentCount;
+
+        CommentsPage(final List<Comment> comments, final String continuation,
+                     final int commentCount) {
+            this.comments = comments;
+            this.continuation = continuation;
+            this.commentCount = commentCount;
+        }
+    }
+
+    private static String videoIdFrom(final String input) {
+        if (input == null || input.trim().isEmpty()) {
+            throw new IllegalArgumentException("YouTube URL or video ID is required");
+        }
+        final String value = input.trim();
+        if (value.matches("[A-Za-z0-9_-]{11}")) {
+            return value;
+        }
+        try {
+            final URL url = new URL(value.startsWith("http") ? value : "https://" + value);
+            final String host = url.getHost().toLowerCase();
+            if (host.equals("youtu.be") || host.endsWith(".youtu.be")) {
+                final String path = url.getPath().replaceFirst("^/", "");
+                if (path.matches("[A-Za-z0-9_-]{11}.*")) {
+                    return path.substring(0, 11);
+                }
+            }
+            final String query = url.getQuery();
+            if (query != null) {
+                for (final String pair : query.split("&")) {
+                    final String[] kv = pair.split("=", 2);
+                    if (kv.length == 2 && "v".equals(kv[0])
+                            && kv[1].matches("[A-Za-z0-9_-]{11}")) {
+                        return kv[1];
+                    }
+                }
+            }
+            final String[] parts = url.getPath().split("/");
+            for (int i = parts.length - 1; i >= 0; i--) {
+                if (parts[i].matches("[A-Za-z0-9_-]{11}")) {
+                    return parts[i];
+                }
+            }
+        } catch (final Exception e) {
+            throw new IllegalArgumentException("Could not read YouTube video ID", e);
+        }
+        throw new IllegalArgumentException("URL does not contain a valid YouTube video ID");
+    }
+
+    private static String appendQuery(final String url, final String key, final String value) {
+        final String separator = url.contains("?") ? "&" : "?";
+        try {
+            return url + separator + URLEncoder.encode(key, "UTF-8") + "="
+                    + URLEncoder.encode(value, "UTF-8");
+        } catch (final Exception e) {
+            return url;
+        }
+    }
+
+    private static Map<String, String> parseQuery(final String query) {
+        if (query == null || query.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        final Map<String, String> result = new LinkedHashMap<>();
+        for (final String pair : query.split("&")) {
+            final String[] kv = pair.split("=", 2);
+            if (kv.length == 2) {
+                result.put(urlDecode(kv[0]), urlDecode(kv[1]));
+            }
+        }
+        return result;
+    }
+
+    private static String urlDecode(final String value) {
+        try {
+            return java.net.URLDecoder.decode(value, "UTF-8");
+        } catch (final Exception e) {
+            return value;
+        }
+    }
+
+    private static void addUnique(final List<?> list, final Object item, final String key) {
+        for (final Object old : list) {
+            final String oldKey;
+            if (old instanceof MediaLink) {
+                oldKey = ((MediaLink) old).url;
+            } else if (old instanceof Subtitle) {
+                oldKey = ((Subtitle) old).url;
+            } else if (old instanceof Thumbnail) {
+                oldKey = ((Thumbnail) old).url;
+            } else {
+                oldKey = null;
+            }
+            if (key != null && key.equals(oldKey)) {
+                return;
+            }
+        }
+        @SuppressWarnings("unchecked")
+        final List<Object> writable = (List<Object>) list;
+        writable.add(item);
+    }
+
+    private static Map<String, Object> map(final Object... pairs) {
+        final Map<String, Object> result = new LinkedHashMap<>();
+        for (int i = 0; i + 1 < pairs.length; i += 2) {
+            result.put(String.valueOf(pairs[i]), pairs[i + 1]);
+        }
+        return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> object(final Object value) {
+        return value instanceof Map ? (Map<String, Object>) value : Collections.emptyMap();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Object> array(final Object value) {
+        return value instanceof List ? (List<Object>) value : Collections.emptyList();
+    }
+
+    private static Object path(final Object root, final String... keys) {
+        Object current = root;
+        for (final String key : keys) {
+            if (current instanceof Map) {
+                current = object(current).get(key);
+            } else if (current instanceof List) {
+                try {
+                    current = array(current).get(Integer.parseInt(key));
+                } catch (final Exception e) {
+                    return null;
+                }
+            } else {
+                return null;
+            }
+        }
+        return current;
+    }
+
+    private static Object firstNonNull(final Object a, final Object b) {
+        return a == null ? b : a;
+    }
+
+    private static String firstNonEmpty(final String a, final String b) {
+        return a == null || a.isEmpty() ? b : a;
+    }
+
+    private static String string(final Object value) {
+        return value instanceof String ? (String) value : null;
+    }
+
+    private static long number(final Object value, final long fallback) {
+        if (value instanceof Number) {
+            return ((Number) value).longValue();
+        }
+        try {
+            return Long.parseLong(String.valueOf(value));
+        } catch (final Exception e) {
+            return fallback;
+        }
+    }
+
+    private static boolean bool(final Object value) {
+        return Boolean.TRUE.equals(value);
+    }
+
+    private static String text(final Object value) {
+        if (value instanceof String) {
+            return (String) value;
+        }
+        final Map<String, Object> object = object(value);
+        final String simple = string(object.get("simpleText"));
+        if (simple != null) {
+            return simple;
+        }
+        final StringBuilder result = new StringBuilder();
+        for (final Object run : array(object.get("runs"))) {
+            final String part = string(object(run).get("text"));
+            if (part != null) {
+                result.append(part);
+            }
+        }
+        return result.length() == 0 ? null : result.toString();
+    }
+
+    private static String message(final Exception exception) {
+        return exception.getMessage() == null
+                ? exception.getClass().getSimpleName() : exception.getMessage();
+    }
+
+    /** Small JSON reader/writer so this source file has no JSON dependency. */
+    private static final class Json {
+        private final String source;
+        private int index;
+
+        private Json(final String source) {
+            this.source = source;
+        }
+
+        static Object parse(final String source) throws IOException {
+            final Json parser = new Json(source);
+            final Object value = parser.value();
+            parser.space();
+            if (parser.index != source.length()) {
+                throw new IOException("Unexpected data after JSON at offset " + parser.index);
+            }
+            return value;
+        }
+
+        static String write(final Object value) {
+            final StringBuilder out = new StringBuilder();
+            writeValue(value, out);
+            return out.toString();
+        }
+
+        private static void writeValue(final Object value, final StringBuilder out) {
+            if (value == null) {
+                out.append("null");
+            } else if (value instanceof String) {
+                quote((String) value, out);
+            } else if (value instanceof Number || value instanceof Boolean) {
+                out.append(value);
+            } else if (value instanceof Map) {
+                out.append('{');
+                boolean first = true;
+                for (final Map.Entry<?, ?> entry : ((Map<?, ?>) value).entrySet()) {
+                    if (!first) {
+                        out.append(',');
+                    }
+                    first = false;
+                    quote(String.valueOf(entry.getKey()), out);
+                    out.append(':');
+                    writeValue(entry.getValue(), out);
+                }
+                out.append('}');
+            } else if (value instanceof List) {
+                out.append('[');
+                boolean first = true;
+                for (final Object item : (List<?>) value) {
+                    if (!first) {
+                        out.append(',');
+                    }
+                    first = false;
+                    writeValue(item, out);
+                }
+                out.append(']');
+            } else {
+                quote(String.valueOf(value), out);
+            }
+        }
+
+        private static void quote(final String value, final StringBuilder out) {
+            out.append('"');
+            for (int i = 0; i < value.length(); i++) {
+                final char c = value.charAt(i);
+                switch (c) {
+                    case '"': out.append("\\\""); break;
+                    case '\\': out.append("\\\\"); break;
+                    case '\b': out.append("\\b"); break;
+                    case '\f': out.append("\\f"); break;
+                    case '\n': out.append("\\n"); break;
+                    case '\r': out.append("\\r"); break;
+                    case '\t': out.append("\\t"); break;
+                    default:
+                        if (c < 0x20) {
+                            out.append(String.format("\\u%04x", (int) c));
+                        } else {
+                            out.append(c);
+                        }
+                }
+            }
+            out.append('"');
+        }
+
+        private Object value() throws IOException {
+            space();
+            if (index >= source.length()) {
+                throw error("Unexpected end of JSON");
+            }
+            final char c = source.charAt(index);
+            if (c == '{') return objectValue();
+            if (c == '[') return arrayValue();
+            if (c == '"') return stringValue();
+            if (c == 't') return literal("true", Boolean.TRUE);
+            if (c == 'f') return literal("false", Boolean.FALSE);
+            if (c == 'n') return literal("null", null);
+            return numberValue();
+        }
+
+        private Map<String, Object> objectValue() throws IOException {
+            index++;
+            final Map<String, Object> result = new LinkedHashMap<>();
+            space();
+            if (consume('}')) return result;
+            while (true) {
+                space();
+                if (index >= source.length() || source.charAt(index) != '"') {
+                    throw error("Expected object key");
+                }
+                final String key = stringValue();
+                space();
+                if (!consume(':')) throw error("Expected ':'");
+                result.put(key, value());
+                space();
+                if (consume('}')) return result;
+                if (!consume(',')) throw error("Expected ',' or '}'");
+            }
+        }
+
+        private List<Object> arrayValue() throws IOException {
+            index++;
+            final List<Object> result = new ArrayList<>();
+            space();
+            if (consume(']')) return result;
+            while (true) {
+                result.add(value());
+                space();
+                if (consume(']')) return result;
+                if (!consume(',')) throw error("Expected ',' or ']'");
+            }
+        }
+
+        private String stringValue() throws IOException {
+            if (!consume('"')) throw error("Expected string");
+            final StringBuilder result = new StringBuilder();
+            while (index < source.length()) {
+                final char c = source.charAt(index++);
+                if (c == '"') return result.toString();
+                if (c != '\\') {
+                    result.append(c);
+                    continue;
+                }
+                if (index >= source.length()) throw error("Bad escape");
+                final char escaped = source.charAt(index++);
+                switch (escaped) {
+                    case '"': result.append('"'); break;
+                    case '\\': result.append('\\'); break;
+                    case '/': result.append('/'); break;
+                    case 'b': result.append('\b'); break;
+                    case 'f': result.append('\f'); break;
+                    case 'n': result.append('\n'); break;
+                    case 'r': result.append('\r'); break;
+                    case 't': result.append('\t'); break;
+                    case 'u':
+                        if (index + 4 > source.length()) throw error("Bad unicode escape");
+                        try {
+                            result.append((char) Integer.parseInt(source.substring(index, index + 4), 16));
+                        } catch (final NumberFormatException e) {
+                            throw error("Bad unicode escape");
+                        }
+                        index += 4;
+                        break;
+                    default: throw error("Unknown escape");
+                }
+            }
+            throw error("Unterminated string");
+        }
+
+        private Object numberValue() throws IOException {
+            final int start = index;
+            if (consume('-')) { /* sign */ }
+            while (index < source.length() && Character.isDigit(source.charAt(index))) index++;
+            if (consume('.')) {
+                while (index < source.length() && Character.isDigit(source.charAt(index))) index++;
+            }
+            if (index < source.length() && (source.charAt(index) == 'e'
+                    || source.charAt(index) == 'E')) {
+                index++;
+                if (index < source.length() && (source.charAt(index) == '+'
+                        || source.charAt(index) == '-')) index++;
+                while (index < source.length() && Character.isDigit(source.charAt(index))) index++;
+            }
+            if (start == index) throw error("Expected value");
+            final String raw = source.substring(start, index);
+            try {
+                if (!raw.contains(".") && !raw.contains("e") && !raw.contains("E")) {
+                    return Long.parseLong(raw);
+                }
+                return Double.parseDouble(raw);
+            } catch (final NumberFormatException e) {
+                throw error("Invalid number");
+            }
+        }
+
+        private Object literal(final String text, final Object value) throws IOException {
+            if (!source.startsWith(text, index)) throw error("Invalid literal");
+            index += text.length();
+            return value;
+        }
+
+        private void space() {
+            while (index < source.length() && Character.isWhitespace(source.charAt(index))) index++;
+        }
+
+        private boolean consume(final char expected) {
+            if (index < source.length() && source.charAt(index) == expected) {
+                index++;
+                return true;
+            }
+            return false;
+        }
+
+        private IOException error(final String message) {
+            return new IOException(message + " at offset " + index);
+        }
+    }
+}
